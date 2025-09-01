@@ -1,0 +1,4 @@
+psutil
+Flask
+mysql-connector-python
+Flask-Cors

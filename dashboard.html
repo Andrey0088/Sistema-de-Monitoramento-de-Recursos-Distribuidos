@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard de Monitoramento</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f0f2f5; color: #333; margin: 0; padding: 20px; }
+        h1, h2 { color: #1c1e21; }
+        .container { max-width: 1200px; margin: auto; }
+        #maquinas-lista { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }
+        .maquina-card { background-color: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); transition: transform 0.2s; }
+        .maquina-card:hover { transform: translateY(-5px); }
+        .maquina-card h3 { margin-top: 0; border-bottom: 1px solid #eee; padding-bottom: 10px; }
+        .metrica { margin-bottom: 10px; }
+        .metrica label { font-weight: bold; min-width: 100px; display: inline-block; }
+        progress { width: 100%; height: 20px; }
+        .status { width: 12px; height: 12px; border-radius: 50%; display: inline-block; margin-right: 8px; }
+        .status.online { background-color: #4caf50; }
+        .status.offline { background-color: #f44336; }
+        #alertas-lista { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 15px; margin-top: 30px; }
+        #alertas-lista ul { list-style: none; padding: 0; }
+        #alertas-lista li { padding: 8px; border-bottom: 1px solid #eee; }
+        #alertas-lista li:last-child { border-bottom: none; }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h1>Dashboard de Monitoramento de Recursos</h1>
+        
+        <h2>Máquinas Conectadas</h2>
+        <div id="maquinas-lista">
+            </div>
+
+        <div id="alertas-lista">
+            <h2>Últimos Alertas</h2>
+            <ul id="lista-de-alertas">
+                </ul>
+        </div>
+    </div>
+
+    <script>
+        const API_URL = 'http://127.0.0.1:5000'; // Endereço da sua API do Agregador
+        const INTERVALO_ATUALIZACAO = 5000; // 5 segundos
+
+        async function buscarDados() {
+            try {
+                // Busca os dados das máquinas e dos alertas em paralelo
+                const [maquinasRes, alertasRes] = await Promise.all([
+                    fetch(`${API_URL}/maquinas`),
+                    fetch(`${API_URL}/alertas`)
+                ]);
+
+                if (!maquinasRes.ok || !alertasRes.ok) {
+                    throw new Error('Falha ao buscar dados da API');
+                }
+
+                const maquinas = await maquinasRes.json();
+                const alertas = await alertasRes.json();
+                
+                atualizarDashboard(maquinas);
+                atualizarAlertas(alertas);
+
+            } catch (error) {
+                console.error("Erro:", error);
+                document.getElementById('maquinas-lista').innerHTML = `<p>Erro ao conectar com o servidor da API.</p>`;
+            }
+        }
+
+        function atualizarDashboard(maquinas) {
+            const listaMaquinas = document.getElementById('maquinas-lista');
+            listaMaquinas.innerHTML = ''; // Limpa a lista antes de atualizar
+
+            if (maquinas.length === 0) {
+                listaMaquinas.innerHTML = '<p>Nenhuma máquina conectada.</p>';
+                return;
+            }
+
+            maquinas.forEach(maquina => {
+                // Verifica se a máquina está online (último contato nos últimos 15 segundos)
+                const ultimoContato = new Date(maquina.ultimo_contato + 'Z'); // Adiciona 'Z' para tratar como UTC
+                const agora = new Date();
+                const statusClass = (agora - ultimoContato) < 15000 ? 'online' : 'offline';
+                const statusTexto = statusClass === 'online' ? 'Online' : 'Offline';
+
+                const card = document.createElement('div');
+                card.className = 'maquina-card';
+                card.innerHTML = `
+                    <h3>
+                        <span class="status ${statusClass}"></span>
+                        Máquina ${maquina.id_maquina.substring(0, 8)}...
+                    </h3>
+                    <p><strong>Status:</strong> ${statusTexto}</p>
+                    <div class="metrica">
+                        <label>CPU:</label>
+                        <span>${maquina.cpu_uso_percent || 0}%</span>
+                        <progress value="${maquina.cpu_uso_percent || 0}" max="100"></progress>
+                    </div>
+                    <div class="metrica">
+                        <label>RAM:</label>
+                        <span>${maquina.ram_uso_percent || 0}%</span>
+                        <progress value="${maquina.ram_uso_percent || 0}" max="100"></progress>
+                    </div>
+                    <div class="metrica">
+                        <label>Disco:</label>
+                        <span>${maquina.disco_uso_percent || 0}%</span>
+                        <progress value="${maquina.disco_uso_percent || 0}" max="100"></progress>
+                    </div>
+                    <p><strong>Temp. CPU:</strong> ${maquina.temperatura_cpu || 0} °C</p>
+                `;
+                listaMaquinas.appendChild(card);
+            });
+        }
+
+        function atualizarAlertas(alertas) {
+            const listaAlertas = document.getElementById('lista-de-alertas');
+            listaAlertas.innerHTML = '';
+
+            if (alertas.length === 0) {
+                listaAlertas.innerHTML = '<li>Nenhum alerta recente.</li>';
+                return;
+            }
+
+            alertas.forEach(alerta => {
+                const item = document.createElement('li');
+                const dataFormatada = new Date(alerta.timestamp + 'Z').toLocaleString('pt-BR');
+                item.innerHTML = `<strong>[${dataFormatada}]</strong> - Máquina ${alerta.id_maquina.substring(0, 8)}... - ${alerta.mensagem}`;
+                listaAlertas.appendChild(item);
+            });
+        }
+
+        // Inicia a busca de dados e define o intervalo para atualização automática
+        document.addEventListener('DOMContentLoaded', () => {
+            buscarDados(); // Primeira busca imediata
+            setInterval(buscarDados, INTERVALO_ATUALIZACAO); // Atualiza a cada X segundos
+        });
+    </script>
+</body>
+</html>
