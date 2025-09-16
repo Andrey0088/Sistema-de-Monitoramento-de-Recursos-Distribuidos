@@ -60,6 +60,7 @@ export function upsertMachineStatic(staticInfo) {
   const item = machines.get(id) ?? {};
   item.static = staticInfo;
   machines.set(id, item);
+  console.log("itemzudo (após upsert): ", machines.get(id));
   if (DEBUG)
     appendDebug(
       `[${id.slice(0, 8)}] static keys: ${Object.keys(staticInfo).join(", ")}`
@@ -73,6 +74,10 @@ export function updateMachineMetrics(id, ts, metrics) {
   item.last = { ts, metrics: norm };
   machines.set(id, item);
   render();
+}
+
+export function getMachineState(id) {
+  return machines.get(id) || null;
 }
 
 function tsToLocal(ts) {
@@ -106,10 +111,6 @@ export function renderAlerts(rows) {
     li.innerHTML = `<strong>${when}</strong> · <span class="mono">${idShort}</span> · ${a.tipo} – ${a.detalhe}`;
     alertsList.appendChild(li);
   }
-}
-
-export function getMachineState(id) {
-  return machines.get(id) || null;
 }
 
 function statusDot(lastSeen) {
@@ -181,7 +182,6 @@ function renderCard(id, data) {
       m.temperature_c ?? "—"
     }°C</span></div>
 
-    <!-- container do popup/expansível -->
     <div class="details" style="display:${
       isOpen ? "block" : "none"
     }; margin-top:12px;"></div>
@@ -213,24 +213,16 @@ function render() {
 
   if (!listenersBound) {
     listenersBound = true;
-
     grid.addEventListener("click", (ev) => {
       const btn = ev.target.closest('button[data-action="toggle-details"]');
       if (!btn) return;
       ev.stopPropagation();
-
       const card = btn.closest(".card");
       if (!card) return;
-
       const id = card.dataset.id;
       const isOpen = expandedIds.has(id);
-
-      if (isOpen) {
-        expandedIds.delete(id);
-      } else {
-        expandedIds.add(id);
-      }
-
+      if (isOpen) expandedIds.delete(id);
+      else expandedIds.add(id);
       render();
     });
   }

@@ -1,4 +1,9 @@
-import { fetchMachines, fetchAlerts, fetchMetrics } from "./api.js";
+import {
+  fetchMachines,
+  fetchMachine,
+  fetchAlerts,
+  fetchMetrics,
+} from "./api.js";
 import { connectWS } from "./ws.js";
 import {
   setWsStatus,
@@ -6,7 +11,6 @@ import {
   upsertMachineStatic,
   updateMachineMetrics,
   renderAlerts,
-  getMachineState,
 } from "./render.js";
 import { seedHistory, pushHistoryPoint, updateCharts } from "./popup.js";
 
@@ -39,6 +43,21 @@ async function preloadHistories(machineList) {
   await Promise.all(Array.from({ length: concurrency }, worker));
 }
 
+async function refreshMachines() {
+  try {
+    const machines = await fetchMachines();
+    for (const m of machines) {
+      upsertMachineStatic({
+        ...m,
+        id_machine: m.id_machine,
+        last_seen: m.last_seen,
+      });
+    }
+  } catch (e) {
+    console.warn("refresh /maquinas falhou", e);
+  }
+}
+
 async function bootstrap() {
   try {
     const [machines, alerts] = await Promise.all([
@@ -53,12 +72,12 @@ async function bootstrap() {
       });
     }
     renderAlerts(alerts);
-
     await preloadHistories(machines);
   } catch (e) {
     console.error("Falha ao carregar estado inicial:", e);
   }
 
+  // WS: somente métricas/alertas em tempo real; estáticos vêm por REST
   connectWS({
     host: WS_HOST,
     port: WS_PORT,
@@ -70,17 +89,29 @@ async function bootstrap() {
         updateCharts(msg.id_machine);
       } else if (msg.type === "alerts") {
         renderAlerts(msg.items || []);
-      } else if (msg.type === "hello" && msg.machine) {
-        upsertMachineStatic(msg.machine);
       }
+      // msg.type === "hello" ignorado — a UI não usa WS para estáticos
     },
   });
 
+  // Poll suave para reidratar estáticos a partir do banco
+  setInterval(refreshMachines, 20000);
+
+  // (Opcional) tentativa de completar campos faltantes via detalhe:
   setInterval(async () => {
+    // Se alguma máquina estiver sem cpu_freq_max/physical, tenta detalhe uma vez
     try {
-      renderAlerts(await fetchAlerts(50));
+      const list = await fetchMachines();
+      for (const m of list) {
+        if (m.cpu_freq_max == null || m.cpu_count_physical == null) {
+          try {
+            const full = await fetchMachine(m.id_machine);
+            if (full && full.id_machine) upsertMachineStatic(full);
+          } catch {}
+        }
+      }
     } catch {}
-  }, 20000);
+  }, 30000);
 }
 
 bootstrap();

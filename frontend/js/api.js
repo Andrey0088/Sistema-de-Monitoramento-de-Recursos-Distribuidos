@@ -11,6 +11,16 @@ export async function fetchMachines() {
   return data;
 }
 
+export async function fetchMachine(id_machine) {
+  const url = `${API_BASE}/maquinas/${encodeURIComponent(id_machine)}`;
+  if (DEBUG) console.log("[REST] GET", url);
+  const r = await fetch(url);
+  if (!r.ok) throw new Error("Falha /maquinas/<id>");
+  const data = await r.json();
+  if (DEBUG) console.log("[REST] /maquinas/<id> ->", data);
+  return data || {};
+}
+
 export async function fetchAlerts(n = 50) {
   const url = `${API_BASE}/alertas/recentes/${n}`;
   if (DEBUG) console.log("[REST] GET", url);

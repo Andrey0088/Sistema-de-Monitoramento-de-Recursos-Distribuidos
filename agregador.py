@@ -1,9 +1,13 @@
 """
-Agregador de Telemetria (Flask + WebSockets)
+Agregador de Telemetria (Flask + WebSockets) – MVP enxuto
 - WS (8765): recebe "hello", "metrics", "heartbeat" dos coletores
 - WS (8766): broadcast em tempo real para o dashboard (somente leitura)
-- API Flask (5000): /health, /maquinas, /metricas/<id>/ultimas/<n>, /alertas/recentes/<n>
-- MySQL: tabelas criadas via init.sql (não há db_init aqui)
+- API Flask (5000):
+    /health
+    /maquinas                           -> lista com estáticos suficientes para a UI
+    /maquinas/<id_machine>              -> detalhe completo (útil p/ debug)
+    /metricas/<id>/ultimas/<n>
+    /alertas/recentes/<n>
 
 Dependências:
   pip install websockets flask flask-cors mysql-connector-python
@@ -23,14 +27,13 @@ import websockets
 import mysql.connector
 
 # =========================
-# Config
+# Config (MVP)
 # =========================
 WS_HOST = os.getenv("WS_HOST", "0.0.0.0")
 WS_PORT_COLLECTORS = int(os.getenv("WS_PORT", "8765"))
 WS_PORT_DASHBOARD = int(os.getenv("WS_PORT_DASH", "8766"))
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
 API_PORT = int(os.getenv("API_PORT", "5000"))
-AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")  # opcional
 
 DB_CFG = {
     "host": os.getenv("DB_HOST", "127.0.0.1"),
@@ -105,7 +108,6 @@ def insert_metrics(id_machine: str, metrics: Dict[str, Any], ts_iso: str):
         ts,
         metrics.get("cpu_percent"),
         metrics.get("ram_percent"),
-        # No DB guardamos ocupação (compat), não atividade:
         metrics.get("disk_space_percent", metrics.get("disk_percent")),
         metrics.get("temperature_c"),
         metrics.get("local_ip"),
@@ -120,13 +122,11 @@ async def maybe_alert(id_machine: str, metrics: Dict[str, Any], ts_iso: str):
         alerts.append(("CPU_ALTA", f"CPU {metrics['cpu_percent']}%"))
     if metrics.get("ram_percent", 0) >= 90:
         alerts.append(("RAM_ALTA", f"RAM {metrics['ram_percent']}%"))
-    # Disco: alerta por espaço cheio (compat com DB)
     disk_occ = metrics.get("disk_space_percent", metrics.get("disk_percent") or 0)
     if disk_occ >= 95:
         alerts.append(("DISCO_QUASE_CHEIO", f"DISCO {disk_occ}%"))
     if not alerts:
         return
-
     conn = db_connect()
     cur = conn.cursor()
     ts = _parse_ts(ts_iso)
@@ -165,7 +165,7 @@ async def dashboard_broadcast(payload: dict):
         DASHBOARD_CLIENTS.discard(ws)
 
 # =========================
-# WS de ingestão (coletores)
+# WS de ingestão (coletores) – sem AUTH
 # =========================
 async def process_message(msg: Dict[str, Any], websocket):
     mtype = msg.get("type")
@@ -176,7 +176,6 @@ async def process_message(msg: Dict[str, Any], websocket):
             return
         upsert_machine(machine)
         await dashboard_broadcast({"type": "hello", "machine": machine})
-        await websocket.send(json.dumps({"type": "ack_hello", "id_machine": machine["id_machine"]}))
         return
 
     if mtype == "heartbeat":
@@ -198,34 +197,16 @@ async def process_message(msg: Dict[str, Any], websocket):
         if not (idm and ts and metrics):
             return
         insert_metrics(idm, metrics, ts)
-        await maybe_alert(idm, metrics, ts)  # <- importante: await
-
-        # broadcast tempo real p/ dashboard
+        await maybe_alert(idm, metrics, ts)
         await dashboard_broadcast({
             "type": "metrics",
             "id_machine": idm,
             "ts": ts,
             "metrics": metrics
         })
-
-        await websocket.send(json.dumps({"type": "ack", "ts": ts, "id_machine": idm}))
         return
 
 async def handle_ws_collectors(websocket):
-    # auth simples por token: primeiro frame
-    if AUTH_TOKEN:
-        try:
-            raw = await asyncio.wait_for(websocket.recv(), timeout=10)
-            msg = json.loads(raw)
-            token = msg.get("token") or msg.get("machine", {}).get("token")
-            if token != AUTH_TOKEN:
-                await websocket.close(code=4001, reason="unauthorized")
-                return
-            await process_message(msg, websocket)
-        except Exception:
-            await websocket.close(code=4002, reason="bad auth/init")
-            return
-
     try:
         async for raw in websocket:
             try:
@@ -258,6 +239,16 @@ def start_ws_server():
 app = Flask(__name__)
 CORS(app)
 
+def _row_normalize(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Converte JSON de 'disks' (se string) e retorna o dicionário normalizado."""
+    out = dict(row)
+    if isinstance(out.get("disks"), str):
+        try:
+            out["disks"] = json.loads(out["disks"])
+        except Exception:
+            pass
+    return out
+
 @app.route("/health")
 def health():
     return jsonify({"ok": True, "time": datetime.utcnow().isoformat()})
@@ -267,15 +258,40 @@ def maquinas():
     conn = db_connect()
     cur = conn.cursor(dictionary=True)
     cur.execute("""
-    SELECT id_machine, hostname, local_ip, os_system, os_release, platform_machine,
-           cpu_count_logical, ram_total, first_seen, last_seen
+    SELECT
+      id_machine, hostname, local_ip,
+      os_system, os_release, os_version,
+      platform_machine,
+      cpu_count_logical, cpu_count_physical, cpu_freq_max,
+      ram_total,
+      first_seen, last_seen
     FROM maquinas
     ORDER BY last_seen DESC
     """)
-    rows = cur.fetchall()
+    rows = [ _row_normalize(r) for r in cur.fetchall() ]
     cur.close()
     conn.close()
     return jsonify(rows)
+
+@app.route("/maquinas/<id_machine>")
+def maquinas_detalhe(id_machine):
+    conn = db_connect()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+    SELECT
+      id_machine, hostname, local_ip,
+      os_system, os_release, os_version,
+      platform, platform_node, platform_release, platform_version, platform_machine, platform_processor,
+      cpu_count_logical, cpu_count_physical, cpu_freq_max,
+      ram_total, disks, python_version, psutil_version,
+      first_seen, last_seen
+    FROM maquinas
+    WHERE id_machine=%s
+    """, (id_machine,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return jsonify(_row_normalize(row) if row else {})
 
 @app.route("/metricas/<id_machine>/ultimas/<int:limite>")
 def metricas_ultimas(id_machine, limite):

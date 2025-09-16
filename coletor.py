@@ -12,9 +12,6 @@ from typing import Dict, Any, Optional, List
 import psutil
 import websockets
 
-# =========================
-# Logging
-# =========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -23,18 +20,17 @@ logging.basicConfig(
 logger = logging.getLogger("coletor")
 
 # =========================
-# Config (hardcoded de MVP)
+# Config (MVP sem auth)
 # =========================
 WS_URL = os.getenv("WS_URL", "ws://127.0.0.1:8765")
-AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
 MACHINE_ID = os.getenv("MACHINE_ID", None)
 SEND_INTERVAL_SEC = int(os.getenv("SEND_INTERVAL_SEC", "5"))
 HEARTBEAT_INTERVAL_SEC = int(os.getenv("HEARTBEAT_INTERVAL_SEC", "30"))
 STATIC_REFRESH_SEC = int(os.getenv("STATIC_REFRESH_SEC", str(24 * 3600)))
 BUFFER_MAX = int(os.getenv("BUFFER_MAX", "1000"))
 
-CPU_SAMPLE_PERIOD_SEC = float(os.getenv("CPU_SAMPLE_PERIOD_SEC", "0.2"))  # 200ms
-CPU_WINDOW_SEC = float(os.getenv("CPU_WINDOW_SEC", "1.0"))                # média móvel ~1s
+CPU_SAMPLE_PERIOD_SEC = float(os.getenv("CPU_SAMPLE_PERIOD_SEC", "0.2"))
+CPU_WINDOW_SEC = float(os.getenv("CPU_WINDOW_SEC", "1.0"))
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -67,6 +63,36 @@ def get_local_ip() -> Optional[str]:
         pass
     return None
 
+def _cpu_counts_physical_safe() -> (int, bool):
+    logical = psutil.cpu_count(logical=True) or 0
+    physical = psutil.cpu_count(logical=False)
+    if physical is None:
+        estimated = None
+        if logical and logical % 2 == 0:
+            estimated = max(1, logical // 2)
+        return (estimated if estimated is not None else None, True)
+    return (physical, False)
+
+def _cpu_freq_max_safe() -> Optional[float]:
+    try:
+        f = psutil.cpu_freq()
+        if f and f.max and f.max > 0:
+            return float(f.max)
+    except Exception:
+        pass
+    try:
+        per = psutil.cpu_freq(percpu=True)
+        if per:
+            max_list = [x.max for x in per if getattr(x, "max", 0) and x.max > 0]
+            if max_list:
+                return float(max(max_list))
+            curr_list = [x.current for x in per if getattr(x, "current", 0)]
+            if curr_list:
+                return float(max(curr_list))
+    except Exception:
+        pass
+    return None
+
 def _system_mountpoint() -> str:
     if os.name == "nt":
         return os.getenv("SystemDrive", "C:") + "\\"
@@ -74,7 +100,6 @@ def _system_mountpoint() -> str:
 
 def get_static_info() -> Dict[str, Any]:
     uname = platform.uname()
-    cpu_freq = psutil.cpu_freq()
     mem = psutil.virtual_memory()
     disks = {}
     for part in psutil.disk_partitions(all=False):
@@ -84,6 +109,9 @@ def get_static_info() -> Dict[str, Any]:
                 disks[part.mountpoint] = {"fstype": part.fstype, "total": usage.total}
             except Exception:
                 pass
+    cpu_logical = psutil.cpu_count(logical=True)
+    cpu_physical, cpu_phys_est = _cpu_counts_physical_safe()
+    cpu_freq_max = _cpu_freq_max_safe()
     return {
         "id_machine": get_machine_id(),
         "hostname": socket.gethostname(),
@@ -97,30 +125,17 @@ def get_static_info() -> Dict[str, Any]:
         "platform_version": uname.version,
         "platform_machine": uname.machine,
         "platform_processor": uname.processor,
-        "cpu_count_logical": psutil.cpu_count(logical=True),
-        "cpu_count_physical": psutil.cpu_count(logical=False),
-        "cpu_freq_max": cpu_freq.max if cpu_freq else None,
+        "cpu_count_logical": cpu_logical,
+        "cpu_count_physical": cpu_physical,
+        "cpu_count_physical_estimated": cpu_phys_est,
+        "cpu_freq_max": cpu_freq_max,
         "ram_total": mem.total,
         "disks": disks,
         "python_version": platform.python_version(),
         "psutil_version": getattr(psutil, "__version__", None),
     }
 
-
-
-
-# =========================
-# Coletor de temperatura
-# =========================
-
-
 def get_temperature_c() -> Optional[float]:
-    """
-    1) Tenta psutil.sensors_temperatures()
-    2) Se Windows e psutil falhar, tenta WMI (requer 'pip install wmi'):
-       classe MSAcpi_ThermalZoneTemperature retorna décimos de Kelvin.
-    """
-    # 1) psutil
     try:
         temps = psutil.sensors_temperatures()
         if temps:
@@ -131,44 +146,32 @@ def get_temperature_c() -> Optional[float]:
                         return float(v)
     except Exception:
         pass
-
-    # 2) WMI (Windows)
     try:
         if platform.system().lower().startswith("win"):
             import wmi  # opcional
             c = wmi.WMI(namespace="root\\WMI")
             for sensor in c.MSAcpi_ThermalZoneTemperature():
-                # valor em décimos de Kelvin
                 kelvin10 = getattr(sensor, "CurrentTemperature", None)
                 if kelvin10:
                     celsius = (kelvin10 / 10.0) - 273.15
                     return float(celsius)
     except Exception:
         pass
-
     return None
 
-# =========================
-# CpuSampler (janela curta ~1s, 200ms tick)
-# =========================
 class CpuSampler:
-    """
-    Mede CPU% por deltas de cpu_times() em alta frequência e mantém
-    uma média móvel (~1s), aproximando o Task Manager.
-    """
     def __init__(self, period_sec: float = 0.2, window_sec: float = 1.0):
         self.period = max(0.05, period_sec)
         self.window = max(self.period, window_sec)
         self.prev_total = None
         self.prev_idle = None
-        self.samples = deque()  # guarda (ts, cpu_percent_instant)
+        self.samples = deque()
         self._task: Optional[asyncio.Task] = None
 
     @staticmethod
     def _tot_idle(times) -> (float, float):
         total = sum(times)
         idle = getattr(times, "idle", 0.0) or 0.0
-        # NÃO somamos iowait ao idle: para aproximar Task Manager (no Windows não existe iowait).
         return total, idle
 
     def _instant_percent(self) -> Optional[float]:
@@ -189,7 +192,6 @@ class CpuSampler:
         return pct
 
     async def _loop(self):
-        # primeira leitura para baseline
         self._instant_percent()
         while True:
             await asyncio.sleep(self.period)
@@ -198,7 +200,6 @@ class CpuSampler:
                 continue
             ts = time.time()
             self.samples.append((ts, pct))
-            # drop antigos fora da janela
             cutoff = ts - self.window
             while self.samples and self.samples[0][0] < cutoff:
                 self.samples.popleft()
@@ -210,12 +211,8 @@ class CpuSampler:
     def get(self) -> Optional[float]:
         if not self.samples:
             return None
-        # média simples dos valores na janela
         return sum(p for _, p in self.samples) / len(self.samples)
 
-# =========================
-# DiskSampler (atividade e taxas)
-# =========================
 class DiskSampler:
     def __init__(self):
         self.prev_time = None
@@ -226,19 +223,16 @@ class DiskSampler:
         total = psutil.disk_io_counters(nowrap=True)
         per_disk = psutil.disk_io_counters(perdisk=True, nowrap=True)
         now = time.time()
-
         if self.prev_time is None:
             self.prev_time = now
             self.prev_total = total
             self.prev_perdisk = per_disk
             return {"disk_activity_percent": None, "disk_read_bps": None, "disk_write_bps": None}
-
         elapsed = max(0.0001, now - self.prev_time)
         delta_read = max(0, total.read_bytes - self.prev_total.read_bytes)
         delta_write = max(0, total.write_bytes - self.prev_total.write_bytes)
         read_bps = delta_read / elapsed
         write_bps = delta_write / elapsed
-
         curr_time_ms = 0
         for name, cur in per_disk.items():
             prev = self.prev_perdisk.get(name)
@@ -249,9 +243,7 @@ class DiskSampler:
             r_old = getattr(prev, "read_time", 0) or 0
             w_old = getattr(prev, "write_time", 0) or 0
             curr_time_ms += max(0, r_now - r_old) + max(0, w_now - w_old)
-
         activity = max(0.0, min(100.0, (curr_time_ms / (elapsed * 1000.0)) * 100.0))
-
         self.prev_time = now
         self.prev_total = total
         self.prev_perdisk = per_disk
@@ -261,17 +253,11 @@ class DiskSampler:
             "disk_write_bps": write_bps,
         }
 
-# =========================
-# Métricas dinâmicas (usando CpuSampler + DiskSampler)
-# =========================
 def get_dynamic_metrics(cpu_sampler: CpuSampler, disk_sampler: DiskSampler) -> Dict[str, Any]:
     cpu_percent = cpu_sampler.get()
     if cpu_percent is None:
-        # fallback rápido até encher a janela
         cpu_percent = psutil.cpu_percent(interval=0.2)
-
     mem = psutil.virtual_memory()
-
     disk_space_percent = None
     try:
         mount = _system_mountpoint()
@@ -284,17 +270,12 @@ def get_dynamic_metrics(cpu_sampler: CpuSampler, disk_sampler: DiskSampler) -> D
                     break
         except Exception:
             pass
-
     disk_derived = disk_sampler.sample()
-
     temperature = get_temperature_c()
-
     return {
         "cpu_percent": cpu_percent,
         "ram_percent": mem.percent,
-        # compat com agregador/DB antigo:
         "disk_percent": disk_space_percent,
-        # novo nome (preferencial no front e broadcast):
         "disk_space_percent": disk_space_percent,
         "disk_activity_percent": disk_derived.get("disk_activity_percent"),
         "disk_read_bps": disk_derived.get("disk_read_bps"),
@@ -303,20 +284,15 @@ def get_dynamic_metrics(cpu_sampler: CpuSampler, disk_sampler: DiskSampler) -> D
         "local_ip": get_local_ip(),
     }
 
-# =========================
-# Buffer e envio
-# =========================
 class Buffer:
     def __init__(self, maxlen: int = 1000):
         self.maxlen = maxlen
         self._q: List[Dict[str, Any]] = []
-
     def push(self, msg: Dict[str, Any]):
         if len(self._q) >= self.maxlen:
             logger.warning("Buffer cheio, descartando mensagem antiga")
             self._q.pop(0)
         self._q.append(msg)
-
     def pop_all(self):
         items = self._q[:]
         self._q.clear()
@@ -325,16 +301,11 @@ class Buffer:
 async def send_json(ws, payload: Dict[str, Any]):
     await ws.send(json.dumps(payload, separators=(",", ":")))
 
-# =========================
-# Loop principal
-# =========================
 async def run_client():
     machine_info = get_static_info()
     buffer = Buffer(BUFFER_MAX)
     cpu_sampler = CpuSampler(CPU_SAMPLE_PERIOD_SEC, CPU_WINDOW_SEC)
     disk_sampler = DiskSampler()
-
-    # inicia o sampler de CPU em background (200ms)
     cpu_sampler.start()
 
     backoff = 1.0
@@ -349,23 +320,26 @@ async def run_client():
                 logger.info("Conexão estabelecida")
                 backoff = 1.0
 
-                hello = {
+                # hello inicial (sem token)
+                await send_json(ws, {
                     "type": "hello",
                     "ts": now_iso(),
-                    "token": AUTH_TOKEN or None,
                     "machine": machine_info,
-                }
-                await send_json(ws, hello)
-                logger.info(
-                    "HELLO enviado: id=%s host=%s ip=%s so=%s %s (%s)",
-                    machine_info["id_machine"],
-                    machine_info["hostname"],
-                    machine_info["local_ip"],
-                    machine_info["os_system"],
-                    machine_info["os_release"],
-                    machine_info["os_version"],
-                )
+                })
+                logger.info("HELLO enviado: id=%s host=%s", machine_info["id_machine"], machine_info["hostname"])
                 last_static_sent = time.time()
+
+                # warmup: reenvia hello se campos críticos estiverem faltando
+                warmup_deadline = time.time() + 30
+                while time.time() < warmup_deadline:
+                    missing_phys = machine_info.get("cpu_count_physical") is None
+                    missing_freq = machine_info.get("cpu_freq_max") in (None, 0)
+                    if not (missing_phys or missing_freq):
+                        break
+                    await asyncio.sleep(5)
+                    machine_info = get_static_info()
+                    await send_json(ws, {"type": "hello", "ts": now_iso(), "machine": machine_info})
+                    logger.info("HELLO (warmup) reenviado para preencher campos faltantes")
 
                 for item in buffer.pop_all():
                     await send_json(ws, item)
@@ -376,44 +350,18 @@ async def run_client():
 
                     if now - last_static_sent >= STATIC_REFRESH_SEC:
                         machine_info = get_static_info()
-                        await send_json(ws, {
-                            "type": "hello",
-                            "ts": now_iso(),
-                            "token": AUTH_TOKEN or None,
-                            "machine": machine_info,
-                        })
-                        logger.info("Reenviado pacote 'hello' (refresh)")
+                        await send_json(ws, {"type": "hello", "ts": now_iso(), "machine": machine_info})
+                        logger.info("HELLO (refresh) reenviado")
                         last_static_sent = now
 
                     if now - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
-                        await send_json(ws, {
-                            "type": "heartbeat",
-                            "ts": now_iso(),
-                            "id_machine": machine_info["id_machine"],
-                        })
-                        logger.debug("Enviado heartbeat")
+                        await send_json(ws, {"type": "heartbeat", "ts": now_iso(), "id_machine": machine_info["id_machine"]})
                         last_heartbeat = now
 
                     metrics = get_dynamic_metrics(cpu_sampler, disk_sampler)
-                    payload = {
-                        "type": "metrics",
-                        "ts": now_iso(),
-                        "id_machine": machine_info["id_machine"],
-                        "metrics": metrics,
-                    }
+                    payload = {"type": "metrics", "ts": now_iso(), "id_machine": machine_info["id_machine"], "metrics": metrics}
                     try:
                         await send_json(ws, payload)
-                        logger.info(
-                            "Métricas: CPU=%.1f%% TEMP=%.0f%% RAM=%.1f%% DISCO_ESP=%.1f%% DISCO_ATV=%s%% R=%.0fB/s W=%.0fB/s IP=%s",
-                            metrics.get("cpu_percent", -1) or 0,
-                            metrics.get("temperature_c", -1) or 0,
-                            metrics.get("ram_percent", -1) or 0,
-                            (metrics.get("disk_space_percent") or 0),
-                            ("%.1f" % metrics["disk_activity_percent"]) if metrics.get("disk_activity_percent") is not None else "n/a",
-                            metrics.get("disk_read_bps") or 0,
-                            metrics.get("disk_write_bps") or 0,
-                            metrics.get("local_ip"),
-                        )
                     except Exception as e:
                         buffer.push(payload)
                         logger.error(f"Falha ao enviar métricas, armazenado no buffer: {e}")
