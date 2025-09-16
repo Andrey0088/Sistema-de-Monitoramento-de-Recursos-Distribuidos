@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Dashboard de Monitoramento</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <h1>Dashboard de Monitoramento</h1>
+      <div id="wsStatus" class="badge">WS: —</div>
+    </header>
+
+    <main class="container">
+      <section>
+        <h2>Máquinas</h2>
+        <div id="machinesGrid" class="grid"></div>
+      </section>
+
+      <section>
+        <h2>Alertas recentes</h2>
+        <ul id="alertsList" class="list"></ul>
+      </section>
+    </main>
+    <div
+      id="debugPanel"
+      style="
+        position: fixed;
+        right: 12px;
+        bottom: 12px;
+        z-index: 9999;
+        max-width: 40vw;
+      "
+    >
+      <details
+        style="
+          background: #121720;
+          border: 1px solid #283549;
+          border-radius: 8px;
+          padding: 8px;
+          color: #e7eef7;
+        "
+      >
+        <summary style="cursor: pointer">Debug (UI)</summary>
+        <div
+          style="
+            font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas,
+              monospace;
+          "
+        >
+          <div id="debugConfig"></div>
+          <div
+            id="debugLastMsg"
+            style="max-height: 35vh; overflow: auto; margin-top: 8px"
+          ></div>
+        </div>
+      </details>
+    </div>
+
+    <script type="module" src="./js/main.js"></script>
+  </body>
+</html>
