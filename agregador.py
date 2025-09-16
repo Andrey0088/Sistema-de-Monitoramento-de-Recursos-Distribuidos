@@ -1,172 +1,339 @@
-import socket
+"""
+Agregador de Telemetria (Flask + WebSockets) – MVP enxuto
+- WS (8765): recebe "hello", "metrics", "heartbeat" dos coletores
+- WS (8766): broadcast em tempo real para o dashboard (somente leitura)
+- API Flask (5000):
+    /health
+    /maquinas                           -> lista com estáticos suficientes para a UI
+    /maquinas/<id_machine>              -> detalhe completo (útil p/ debug)
+    /metricas/<id>/ultimas/<n>
+    /alertas/recentes/<n>
+
+Dependências:
+  pip install websockets flask flask-cors mysql-connector-python
+"""
+
+import asyncio
 import json
+import os
 import threading
-import mysql.connector
+from datetime import datetime, timezone
+from typing import Dict, Any
+
 from flask import Flask, jsonify
 from flask_cors import CORS
 
-# --- CONFIGURAÇÕES DO BANCO DE DADOS ---
-DB_CONFIG = {
-    'host': 'localhost',
-    'user': 'root',
-    'password': "Andrey@2",
-    'database': 'monitoramento_db'
+import websockets
+import mysql.connector
+
+# =========================
+# Config (MVP)
+# =========================
+WS_HOST = os.getenv("WS_HOST", "0.0.0.0")
+WS_PORT_COLLECTORS = int(os.getenv("WS_PORT", "8765"))
+WS_PORT_DASHBOARD = int(os.getenv("WS_PORT_DASH", "8766"))
+API_HOST = os.getenv("API_HOST", "0.0.0.0")
+API_PORT = int(os.getenv("API_PORT", "5000"))
+
+DB_CFG = {
+    "host": os.getenv("DB_HOST", "127.0.0.1"),
+    "port": int(os.getenv("DB_PORT", "3306")),
+    "user": os.getenv("DB_USER", "root"),
+    "password": os.getenv("DB_PASSWORD", "root"),
+    "database": os.getenv("DB_NAME", "telemetria"),
+    "autocommit": True,
 }
 
-# --- CONFIGURAÇÕES DO SERVIDOR ---
-HOST_TCP = '0.0.0.0' # Escuta em todas as interfaces de rede
-PORTA_TCP = 9999
-HOST_API = '0.0.0.0'
-PORTA_API = 5000
+# =========================
+# DB helpers
+# =========================
+def db_connect():
+    return mysql.connector.connect(**DB_CFG)
 
-# Limiares para alertas
-LIMIAR_CPU_ALERTA = 90.0
-LIMIAR_RAM_ALERTA = 85.0
-
-# --- LÓGICA DO BANCO DE DADOS ---
-def conectar_db():
-    """Cria uma conexão com o banco de dados."""
-    return mysql.connector.connect(**DB_CONFIG)
-
-def salvar_dados(dados):
-    """Salva os dados recebidos no banco de dados MySQL."""
-    conn = conectar_db()
-    cursor = conn.cursor()
-
-    id_maquina = dados.get('id_maquina')
-
-    if dados.get('tipo') == 'estatico':
-        # Insere ou atualiza os dados estáticos da máquina
-        sql = """
-        INSERT INTO maquinas (id_maquina, info_cpu, memoria_total_gb, disco_total_gb)
-        VALUES (%s, %s, %s, %s)
-        ON DUPLICATE KEY UPDATE
-        info_cpu = VALUES(info_cpu), memoria_total_gb = VALUES(memoria_total_gb), disco_total_gb = VALUES(disco_total_gb);
-        """
-        valores = (id_maquina, json.dumps(dados.get('info_cpu')), dados.get('memoria_total_gb'), dados.get('disco_total_gb'))
-        cursor.execute(sql, valores)
-
-    elif dados.get('tipo') == 'dinamico':
-        # Insere os dados dinâmicos
-        sql = """
-        INSERT INTO metricas (id_maquina, cpu_uso_percent, ram_uso_percent, disco_uso_percent, temperatura_cpu)
-        VALUES (%s, %s, %s, %s, %s);
-        """
-        valores = (id_maquina, dados.get('cpu_uso_percent'), dados.get('ram_uso_percent'), dados.get('disco_uso_percent'), dados.get('temperatura_cpu'))
-        cursor.execute(sql, valores)
-        
-        # Atualiza o timestamp da máquina para saber que está ativa
-        cursor.execute("UPDATE maquinas SET ultimo_contato = CURRENT_TIMESTAMP WHERE id_maquina = %s", (id_maquina,))
-
-        # Verifica se algum limiar de alerta foi ultrapassado
-        verificar_alertas(cursor, id_maquina, dados)
-
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-def verificar_alertas(cursor, id_maquina, dados):
-    """Verifica e insere alertas no banco de dados."""
-    cpu = dados.get('cpu_uso_percent', 0)
-    ram = dados.get('ram_uso_percent', 0)
-
-    if cpu > LIMIAR_CPU_ALERTA:
-        msg = f"Uso de CPU atingiu {cpu}%, ultrapassando o limiar de {LIMIAR_CPU_ALERTA}%."
-        sql = "INSERT INTO alertas (id_maquina, tipo_alerta, valor_registrado, mensagem) VALUES (%s, %s, %s, %s)"
-        cursor.execute(sql, (id_maquina, 'CPU_ALTA', cpu, msg))
-        print(f"ALERTA GERADO para {id_maquina}: {msg}")
-
-    if ram > LIMIAR_RAM_ALERTA:
-        msg = f"Uso de RAM atingiu {ram}%, ultrapassando o limiar de {LIMIAR_RAM_ALERTA}%."
-        sql = "INSERT INTO alertas (id_maquina, tipo_alerta, valor_registrado, mensagem) VALUES (%s, %s, %s, %s)"
-        cursor.execute(sql, (id_maquina, 'RAM_ALTA', ram, msg))
-        print(f"ALERTA GERADO para {id_maquina}: {msg}")
-
-# --- LÓGICA DO SERVIDOR TCP ---
-def manipular_cliente(conn, addr):
-    """Lida com a conexão de um coletor."""
-    print(f"Conexão recebida de {addr}")
-    try:
-        dados_recebidos = b''
-        while True:
-            parte = conn.recv(1024)
-            if not parte:
-                break
-            dados_recebidos += parte
-        
-        if dados_recebidos:
-            dados = json.loads(dados_recebidos.decode('utf-8'))
-            print(f"Dados deserializados: {dados}")
-            salvar_dados(dados)
-
-    except Exception as e:
-        print(f"Erro ao manipular cliente {addr}: {e}")
-    finally:
-        conn.close()
-        print(f"Conexão com {addr} fechada.")
-
-def iniciar_servidor_tcp():
-    """Inicia o servidor TCP para escutar os coletores."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((HOST_TCP, PORTA_TCP))
-        s.listen()
-        print(f"Servidor TCP escutando em {HOST_TCP}:{PORTA_TCP}")
-        while True:
-            conn, addr = s.accept()
-            # Cria uma nova thread para cada cliente, para não bloquear o servidor
-            thread_cliente = threading.Thread(target=manipular_cliente, args=(conn, addr))
-            thread_cliente.start()
-
-# --- LÓGICA DA API REST (FLASK) ---
-app = Flask(__name__)
-CORS(app) # Permite que o frontend (HTML/JS) acesse a API
-
-@app.route('/maquinas', methods=['GET'])
-def get_maquinas():
-    """Retorna a lista de todas as máquinas e suas últimas métricas."""
-    conn = conectar_db()
-    cursor = conn.cursor(dictionary=True)
-    
-    # Query para pegar os dados estáticos e a última métrica de cada máquina
-    sql = """
-    SELECT m.*, met.cpu_uso_percent, met.ram_uso_percent, met.disco_uso_percent, met.temperatura_cpu, met.timestamp
-    FROM maquinas m
-    LEFT JOIN (
-        SELECT id_maquina, cpu_uso_percent, ram_uso_percent, disco_uso_percent, temperatura_cpu, timestamp,
-        ROW_NUMBER() OVER(PARTITION BY id_maquina ORDER BY timestamp DESC) as rn
-        FROM metricas
-    ) as met ON m.id_maquina = met.id_maquina AND met.rn = 1
-    ORDER BY m.ultimo_contato DESC;
+def upsert_machine(machine: Dict[str, Any]):
+    conn = db_connect()
+    cur = conn.cursor()
+    q = """
+    INSERT INTO maquinas
+    (id_machine, hostname, local_ip, os_system, os_release, os_version, platform, platform_node,
+     platform_release, platform_version, platform_machine, platform_processor, cpu_count_logical,
+     cpu_count_physical, cpu_freq_max, ram_total, disks, python_version, psutil_version,
+     first_seen, last_seen)
+    VALUES (%(id_machine)s, %(hostname)s, %(local_ip)s, %(os_system)s, %(os_release)s, %(os_version)s,
+            %(platform)s, %(platform_node)s, %(platform_release)s, %(platform_version)s, %(platform_machine)s,
+            %(platform_processor)s, %(cpu_count_logical)s, %(cpu_count_physical)s, %(cpu_freq_max)s,
+            %(ram_total)s, %(disks)s, %(python_version)s, %(psutil_version)s, NOW(), NOW())
+    ON DUPLICATE KEY UPDATE
+        hostname=VALUES(hostname),
+        local_ip=VALUES(local_ip),
+        os_system=VALUES(os_system),
+        os_release=VALUES(os_release),
+        os_version=VALUES(os_version),
+        platform=VALUES(platform),
+        platform_node=VALUES(platform_node),
+        platform_release=VALUES(platform_release),
+        platform_version=VALUES(platform_version),
+        platform_machine=VALUES(platform_machine),
+        platform_processor=VALUES(platform_processor),
+        cpu_count_logical=VALUES(cpu_count_logical),
+        cpu_count_physical=VALUES(cpu_count_physical),
+        cpu_freq_max=VALUES(cpu_freq_max),
+        ram_total=VALUES(ram_total),
+        disks=VALUES(disks),
+        python_version=VALUES(python_version),
+        psutil_version=VALUES(psutil_version),
+        last_seen=NOW();
     """
-    cursor.execute(sql)
-    resultado = cursor.fetchall()
-    
-    cursor.close()
+    machine2 = dict(machine)
+    if isinstance(machine2.get("disks"), (dict, list)):
+        machine2["disks"] = json.dumps(machine2["disks"], separators=(",", ":"))
+    cur.execute(q, machine2)
+    cur.close()
     conn.close()
-    return jsonify(resultado)
 
-@app.route('/alertas', methods=['GET'])
-def get_alertas():
-    """Retorna os 20 alertas mais recentes."""
-    conn = conectar_db()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM alertas ORDER BY timestamp DESC LIMIT 20")
-    resultado = cursor.fetchall()
-    cursor.close()
+def _parse_ts(ts_iso: str):
+    return datetime.fromisoformat(ts_iso.replace("Z", "+00:00")).astimezone(timezone.utc).replace(tzinfo=None)
+
+def insert_metrics(id_machine: str, metrics: Dict[str, Any], ts_iso: str):
+    conn = db_connect()
+    cur = conn.cursor()
+    q = """
+    INSERT INTO metricas
+    (id_machine, ts, cpu_percent, ram_percent, disk_percent, temperature_c, local_ip)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """
+    ts = _parse_ts(ts_iso)
+    cur.execute(q, (
+        id_machine,
+        ts,
+        metrics.get("cpu_percent"),
+        metrics.get("ram_percent"),
+        metrics.get("disk_space_percent", metrics.get("disk_percent")),
+        metrics.get("temperature_c"),
+        metrics.get("local_ip"),
+    ))
+    conn.commit()
+    cur.close()
     conn.close()
-    return jsonify(resultado)
 
-def iniciar_api_rest():
-    """Inicia a API Flask."""
-    app.run(host=HOST_API, port=PORTA_API, debug=False)
+async def maybe_alert(id_machine: str, metrics: Dict[str, Any], ts_iso: str):
+    alerts = []
+    if metrics.get("cpu_percent", 0) >= 90:
+        alerts.append(("CPU_ALTA", f"CPU {metrics['cpu_percent']}%"))
+    if metrics.get("ram_percent", 0) >= 90:
+        alerts.append(("RAM_ALTA", f"RAM {metrics['ram_percent']}%"))
+    disk_occ = metrics.get("disk_space_percent", metrics.get("disk_percent") or 0)
+    if disk_occ >= 95:
+        alerts.append(("DISCO_QUASE_CHEIO", f"DISCO {disk_occ}%"))
+    if not alerts:
+        return
+    conn = db_connect()
+    cur = conn.cursor()
+    ts = _parse_ts(ts_iso)
+    cur.executemany(
+        "INSERT INTO alertas (id_machine, ts, tipo, detalhe) VALUES (%s, %s, %s, %s)",
+        [(id_machine, ts, a, d) for a, d in alerts]
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
 
-# --- INICIALIZAÇÃO ---
+# =========================
+# Broadcast p/ dashboard (WS 8766)
+# =========================
+DASHBOARD_CLIENTS = set()
+
+async def dashboard_ws_handler(websocket):
+    DASHBOARD_CLIENTS.add(websocket)
+    try:
+        async for _ in websocket:
+            pass
+    finally:
+        DASHBOARD_CLIENTS.discard(websocket)
+
+async def dashboard_broadcast(payload: dict):
+    if not DASHBOARD_CLIENTS:
+        return
+    msg = json.dumps(payload, separators=(",", ":"))
+    dead = []
+    for ws in DASHBOARD_CLIENTS:
+        try:
+            await ws.send(msg)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        DASHBOARD_CLIENTS.discard(ws)
+
+# =========================
+# WS de ingestão (coletores) – sem AUTH
+# =========================
+async def process_message(msg: Dict[str, Any], websocket):
+    mtype = msg.get("type")
+
+    if mtype == "hello":
+        machine = msg.get("machine") or {}
+        if "id_machine" not in machine:
+            return
+        upsert_machine(machine)
+        await dashboard_broadcast({"type": "hello", "machine": machine})
+        return
+
+    if mtype == "heartbeat":
+        idm = msg.get("id_machine")
+        if not idm:
+            return
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute("UPDATE maquinas SET last_seen = NOW() WHERE id_machine = %s", (idm,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return
+
+    if mtype == "metrics":
+        idm = msg.get("id_machine")
+        metrics = msg.get("metrics") or {}
+        ts = msg.get("ts")
+        if not (idm and ts and metrics):
+            return
+        insert_metrics(idm, metrics, ts)
+        await maybe_alert(idm, metrics, ts)
+        await dashboard_broadcast({
+            "type": "metrics",
+            "id_machine": idm,
+            "ts": ts,
+            "metrics": metrics
+        })
+        return
+
+async def handle_ws_collectors(websocket):
+    try:
+        async for raw in websocket:
+            try:
+                msg = json.loads(raw)
+                await process_message(msg, websocket)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+def start_ws_server():
+    async def ws_main():
+        ws_collectors = websockets.serve(
+            lambda ws, path=None: handle_ws_collectors(ws),
+            WS_HOST, WS_PORT_COLLECTORS, ping_interval=20, ping_timeout=20, max_queue=256
+        )
+        ws_dashboards = websockets.serve(
+            lambda ws, path=None: dashboard_ws_handler(ws),
+            WS_HOST, WS_PORT_DASHBOARD, ping_interval=20, ping_timeout=20, max_queue=256
+        )
+        async with ws_collectors, ws_dashboards:
+            print(f"[ws] Colectors WS em ws://{WS_HOST}:{WS_PORT_COLLECTORS}")
+            print(f"[ws] Dashboard WS em ws://{WS_HOST}:{WS_PORT_DASHBOARD}")
+            await asyncio.Future()  # run forever
+    asyncio.run(ws_main())
+
+# =========================
+# API Flask (leitura)
+# =========================
+app = Flask(__name__)
+CORS(app)
+
+def _row_normalize(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Converte JSON de 'disks' (se string) e retorna o dicionário normalizado."""
+    out = dict(row)
+    if isinstance(out.get("disks"), str):
+        try:
+            out["disks"] = json.loads(out["disks"])
+        except Exception:
+            pass
+    return out
+
+@app.route("/health")
+def health():
+    return jsonify({"ok": True, "time": datetime.utcnow().isoformat()})
+
+@app.route("/maquinas")
+def maquinas():
+    conn = db_connect()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+    SELECT
+      id_machine, hostname, local_ip,
+      os_system, os_release, os_version,
+      platform_machine,
+      cpu_count_logical, cpu_count_physical, cpu_freq_max,
+      ram_total,
+      first_seen, last_seen
+    FROM maquinas
+    ORDER BY last_seen DESC
+    """)
+    rows = [ _row_normalize(r) for r in cur.fetchall() ]
+    cur.close()
+    conn.close()
+    return jsonify(rows)
+
+@app.route("/maquinas/<id_machine>")
+def maquinas_detalhe(id_machine):
+    conn = db_connect()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+    SELECT
+      id_machine, hostname, local_ip,
+      os_system, os_release, os_version,
+      platform, platform_node, platform_release, platform_version, platform_machine, platform_processor,
+      cpu_count_logical, cpu_count_physical, cpu_freq_max,
+      ram_total, disks, python_version, psutil_version,
+      first_seen, last_seen
+    FROM maquinas
+    WHERE id_machine=%s
+    """, (id_machine,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return jsonify(_row_normalize(row) if row else {})
+
+@app.route("/metricas/<id_machine>/ultimas/<int:limite>")
+def metricas_ultimas(id_machine, limite):
+    limite = max(1, min(limite, 2000))
+    conn = db_connect()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+    SELECT ts, cpu_percent, ram_percent, disk_percent, temperature_c, local_ip
+    FROM metricas
+    WHERE id_machine=%s
+    ORDER BY ts DESC
+    LIMIT %s
+    """, (id_machine, limite))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return jsonify(rows)
+
+@app.route("/alertas/recentes/<int:limite>")
+def alertas_recentes(limite):
+    limite = max(1, min(limite, 1000))
+    conn = db_connect()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+    SELECT id_machine, ts, tipo, detalhe
+    FROM alertas
+    ORDER BY ts DESC
+    LIMIT %s
+    """, (limite,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return jsonify(rows)
+
+def start_api():
+    print(f"[api] Flask em http://{API_HOST}:{API_PORT}")
+    app.run(host=API_HOST, port=API_PORT, debug=False, use_reloader=False)
+
+def main():
+    t_ws = threading.Thread(target=start_ws_server, daemon=True)
+    t_ws.start()
+    start_api()
+
 if __name__ == "__main__":
-    # Inicia o servidor TCP em uma thread separada
-    thread_tcp = threading.Thread(target=iniciar_servidor_tcp)
-    thread_tcp.daemon = True # Permite que o programa principal feche mesmo com a thread rodando
-    thread_tcp.start()
-    
-    # Inicia a API REST na thread principal
-    print(f"Servidor da API REST rodando em http://{HOST_API}:{PORTA_API}")
-    iniciar_api_rest()
+    main()
